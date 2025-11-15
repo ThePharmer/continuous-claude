@@ -1,6 +1,6 @@
 # 🔂 Continuous Claude
 
-Automated wrapper for Claude Code that runs tasks repeatedly with automatic git commits, PR creation, merge queue, and error handling.
+Automated wrapper for Claude Code that continuously executes tasks with automatic git commits, PR creation, CI/CD integration, and intelligent error handling.
 
 ## ⚙️ How it works
 
