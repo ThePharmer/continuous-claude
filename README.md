@@ -12,7 +12,7 @@ When you have a task like "Add unit tests until all code is covered", you want t
 - It waits for all required PR checks to pass
 - Once checks are successful, the PR is merged
 - This process repeats until your task is complete
-- An `ITERATION_NOTES.md` file is automatically maintained to coordinate work across iterations, enabling seamless collaboration between humans and AI agents
+- A `SHARED_TASK_NOTES.md` file is automatically maintained to coordinate work across iterations, enabling seamless collaboration between humans and AI agents
 
 ## 🚀 Quick start
 

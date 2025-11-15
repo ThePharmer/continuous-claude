@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ADDITIONAL_FLAGS="--dangerously-skip-permissions --output-format json"
-NOTES_FILE="ITERATION_NOTES.md"
+NOTES_FILE="SHARED_TASK_NOTES.md"
 
 PROMPT=""
 MAX_RUNS=""
