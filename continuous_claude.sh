@@ -6,6 +6,10 @@ ADDITIONAL_FLAGS="--dangerously-skip-permissions --output-format json"
 
 NOTES_FILE="SHARED_TASK_NOTES.md"
 
+# Configurable delays
+PR_SETUP_DELAY="${PR_SETUP_DELAY:-5}"  # Seconds to wait for GitHub PR setup
+ITERATION_DELAY="${ITERATION_DELAY:-1}"  # Seconds between iterations
+
 PROMPT_JQ_INSTALL="Please install jq for JSON parsing"
 
 PROMPT_COMMIT_MESSAGE="Please review the dirty files in the git repository, write a commit message with: (1) a short one-line summary, (2) two newlines, (3) then a detailed explanation. Do not include any footers or metadata like 'Generated with Claude Code' or 'Co-Authored-By'. Feel free to look at the last few commits to get a sense of the commit message style. Track all files and commit the changes using 'git commit -am \"your message\"' (don't push, just commit, no need to ask for confirmation)."
@@ -147,6 +151,10 @@ parse_arguments() {
                 shift 2
                 ;;
             --git-branch-prefix)
+                if ! [[ "$2" =~ ^[a-zA-Z0-9_/-]+$ ]]; then
+                    echo "❌ Error: --git-branch-prefix must contain only alphanumeric, underscore, dash, or slash characters" >&2
+                    exit 1
+                fi
                 GIT_BRANCH_PREFIX="$2"
                 shift 2
                 ;;
@@ -167,6 +175,10 @@ parse_arguments() {
                 shift
                 ;;
             --notes-file)
+                if [[ "$2" == /* ]] || [[ "$2" == *..* ]]; then
+                    echo "❌ Error: --notes-file must be a relative path without '..' (security restriction)" >&2
+                    exit 1
+                fi
                 NOTES_FILE="$2"
                 shift 2
                 ;;
@@ -299,10 +311,10 @@ wait_for_pr_checks() {
         fi
 
         local check_count=$(echo "$checks_json" | jq 'length' 2>/dev/null || echo "0")
-        
+
         local all_completed=true
         local all_success=true
-        
+
         if [ "$no_checks_configured" = "false" ] && [ "$check_count" -eq 0 ]; then
             all_completed=false
         fi
@@ -310,13 +322,10 @@ wait_for_pr_checks() {
         local pending_count=0
         local success_count=0
         local failed_count=0
-        
-        if [ "$check_count" -gt 0 ]; then
-            local idx=0
-            while [ $idx -lt $check_count ]; do
-                local state=$(echo "$checks_json" | jq -r ".[$idx].state")
-                local bucket=$(echo "$checks_json" | jq -r ".[$idx].bucket // \"pending\"")
 
+        if [ "$check_count" -gt 0 ]; then
+            # Parse JSON once and iterate over results - O(n) instead of O(n²)
+            while IFS=$'\t' read -r bucket; do
                 if [ "$bucket" = "pending" ] || [ "$bucket" = "null" ]; then
                     all_completed=false
                     pending_count=$((pending_count + 1))
@@ -326,9 +335,7 @@ wait_for_pr_checks() {
                 else
                     success_count=$((success_count + 1))
                 fi
-
-                idx=$((idx + 1))
-            done
+            done < <(echo "$checks_json" | jq -r '.[] | .bucket // "pending"')
         fi
 
         local pr_info
@@ -512,8 +519,9 @@ create_iteration_branch() {
     
     if [[ "$current_branch" == ${GIT_BRANCH_PREFIX}* ]]; then
         echo "⚠️  $iteration_display Already on iteration branch: $current_branch" >&2
-        git checkout main >/dev/null 2>&1 || return 1
-        current_branch="main"
+        local default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+        git checkout "${default_branch:-main}" >/dev/null 2>&1 || return 1
+        current_branch="${default_branch:-main}"
     fi
     
     local date_str=$(date +%Y-%m-%d)
@@ -593,8 +601,22 @@ continuous_claude_commit() {
     local commit_body=$(echo "$commit_message" | tail -n +4)
 
     echo "📤 $iteration_display Pushing branch..." >&2
-    if ! git push -u origin "$branch_name" >/dev/null 2>&1; then
-        echo "⚠️  $iteration_display Failed to push branch" >&2
+    local push_attempts=0
+    local max_push_attempts=3
+    while [ $push_attempts -lt $max_push_attempts ]; do
+        if git push -u origin "$branch_name" >/dev/null 2>&1; then
+            break
+        fi
+        push_attempts=$((push_attempts + 1))
+        if [ $push_attempts -lt $max_push_attempts ]; then
+            local delay=$((2 ** push_attempts))
+            echo "⚠️  $iteration_display Push failed, retrying in ${delay}s (attempt $push_attempts/$max_push_attempts)..." >&2
+            sleep $delay
+        fi
+    done
+
+    if [ $push_attempts -eq $max_push_attempts ]; then
+        echo "⚠️  $iteration_display Failed to push branch after $max_push_attempts attempts" >&2
         git checkout "$main_branch" >/dev/null 2>&1
         return 1
     fi
@@ -614,8 +636,8 @@ continuous_claude_commit() {
         return 1
     fi
 
-    echo "🔍 $iteration_display PR #$pr_number created, waiting 5 seconds for GitHub to set up..." >&2
-    sleep 5
+    echo "🔍 $iteration_display PR #$pr_number created, waiting ${PR_SETUP_DELAY} seconds for GitHub to set up..." >&2
+    sleep $PR_SETUP_DELAY
     if ! wait_for_pr_checks "$pr_number" "$GITHUB_OWNER" "$GITHUB_REPO" "$iteration_display"; then
         echo "⚠️  $iteration_display PR checks failed or timed out, closing PR..." >&2
         gh pr close "$pr_number" --repo "$GITHUB_OWNER/$GITHUB_REPO" --comment "Closing PR due to failed checks or timeout" >/dev/null 2>&1 || true
@@ -685,7 +707,8 @@ setup_worktree() {
     
     # Make worktree path absolute if it's relative
     if [[ "$worktree_path" != /* ]]; then
-        worktree_path="${main_repo_dir}/${worktree_path}"
+        # Resolve relative to main repo directory, not CWD
+        worktree_path="$(cd "$main_repo_dir" && cd "$(dirname "$worktree_path")" && pwd)/$(basename "$worktree_path")"
     fi
     
     # Get current branch (usually main or master)
@@ -794,7 +817,7 @@ run_claude_iteration() {
     local flags="$2"
     local error_log="$3"
 
-    claude -p "$prompt" $flags "${EXTRA_CLAUDE_FLAGS[@]}" 2> >(tee "$error_log" >&2)
+    claude -p "$prompt" "$flags" "${EXTRA_CLAUDE_FLAGS[@]}" 2> >(tee "$error_log" >&2)
 }
 
 parse_claude_result() {
@@ -1001,9 +1024,9 @@ main_loop() {
             break
         fi
         
-        execute_single_iteration $i
-        
-        sleep 1
+        execute_single_iteration "$i"
+
+        sleep $ITERATION_DELAY
         i=$((i + 1))
     done
 }
@@ -1030,9 +1053,10 @@ main() {
     
     # Setup worktree if specified
     setup_worktree
-    
+
+    umask 077
     ERROR_LOG=$(mktemp)
-    trap "rm -f $ERROR_LOG; cleanup_worktree" EXIT
+    trap "rm -f '$ERROR_LOG'; cleanup_worktree" EXIT
     
     main_loop
     show_completion_summary
